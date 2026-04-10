@@ -234,8 +234,17 @@ class ApprovalView(discord.ui.View):
             await db.commit()
 
         # Delete the pending embed
-        await delete_message_safe(interaction.guild, PENDING_CHANNEL_ID, char[11])
+try:
+    channel = interaction.guild.get_channel(PENDING_CHANNEL_ID)
+    msg = await channel.fetch_message(char[11])
 
+    embed = msg.embeds[0]
+    embed.colour = discord.Colour.green()
+    embed.set_footer(text="APPROVED")
+
+    await msg.edit(content="📌 CLAIM APPROVED", embed=embed, view=None)
+except:
+    pass
         # DM owner
         if owner:
             try:
@@ -271,7 +280,17 @@ class ApprovalView(discord.ui.View):
             except discord.Forbidden:
                 pass
 
-        await delete_message_safe(interaction.guild, PENDING_CHANNEL_ID, char[11])
+try:
+    channel = interaction.guild.get_channel(PENDING_CHANNEL_ID)
+    msg = await channel.fetch_message(char[11])
+
+    embed = msg.embeds[0]
+    embed.colour = discord.Colour.red()
+    embed.set_footer(text="DENIED")
+
+    await msg.edit(content="📌 CLAIM DENIED", embed=embed, view=None)
+except:
+    pass
 
         async with aiosqlite.connect(DB) as db:
             await db.execute(
