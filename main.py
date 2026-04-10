@@ -246,7 +246,7 @@ try:
 except:
     pass
         # DM owner
-        if owner:
+    if owner:
             try:
                 await owner.send(
                     f"✅ Your claim for **{char[2].title()}** on **{interaction.guild.name}** has been approved!"
