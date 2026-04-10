@@ -188,7 +188,7 @@ class ApprovalView(discord.ui.View):
     def __init__(self, char_name: str, guild_id: int):
         super().__init__(timeout=None)
         self.char_name = char_name
-        self.guild_id  = guild_id
+        self.guild_id = guild_id
 
     @discord.ui.button(label="Approve ✅", style=discord.ButtonStyle.success, custom_id="btn_approve")
     async def approve_button(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -220,10 +220,11 @@ class ApprovalView(discord.ui.View):
 
         # Post to approved channel
         approved_channel = interaction.guild.get_channel(APPROVAL_CHANNEL_ID)
-        approved_msg_id  = None
+        approved_msg_id = None
+
         if approved_channel:
             embed = build_embed(char[2], char[3], char[4], char[6], char[5], owner, "approved")
-            msg   = await approved_channel.send(embed=embed)
+            msg = await approved_channel.send(embed=embed)
             approved_msg_id = msg.id
 
         async with aiosqlite.connect(DB) as db:
@@ -233,20 +234,21 @@ class ApprovalView(discord.ui.View):
             )
             await db.commit()
 
-        # Delete the pending embed
-try:
-    channel = interaction.guild.get_channel(PENDING_CHANNEL_ID)
-    msg = await channel.fetch_message(char[11])
+        # Update pending message instead of deleting
+        try:
+            channel = interaction.guild.get_channel(PENDING_CHANNEL_ID)
+            msg = await channel.fetch_message(char[11])
 
-    embed = msg.embeds[0]
-    embed.colour = discord.Colour.green()
-    embed.set_footer(text="APPROVED")
+            embed = msg.embeds[0]
+            embed.colour = discord.Colour.green()
+            embed.set_footer(text="APPROVED")
 
-    await msg.edit(content="📌 CLAIM APPROVED", embed=embed, view=None)
-except:
-    pass
+            await msg.edit(content="📌 CLAIM APPROVED", embed=embed, view=None)
+        except:
+            pass
+
         # DM owner
-    if owner:
+        if owner:
             try:
                 await owner.send(
                     f"✅ Your claim for **{char[2].title()}** on **{interaction.guild.name}** has been approved!"
@@ -272,6 +274,7 @@ except:
             return
 
         owner = interaction.guild.get_member(char[7])
+
         if owner:
             try:
                 await owner.send(
@@ -280,17 +283,18 @@ except:
             except discord.Forbidden:
                 pass
 
-try:
-    channel = interaction.guild.get_channel(PENDING_CHANNEL_ID)
-    msg = await channel.fetch_message(char[11])
+        # Update pending message instead of deleting
+        try:
+            channel = interaction.guild.get_channel(PENDING_CHANNEL_ID)
+            msg = await channel.fetch_message(char[11])
 
-    embed = msg.embeds[0]
-    embed.colour = discord.Colour.red()
-    embed.set_footer(text="DENIED")
+            embed = msg.embeds[0]
+            embed.colour = discord.Colour.red()
+            embed.set_footer(text="DENIED")
 
-    await msg.edit(content="📌 CLAIM DENIED", embed=embed, view=None)
-except:
-    pass
+            await msg.edit(content="📌 CLAIM DENIED", embed=embed, view=None)
+        except:
+            pass
 
         async with aiosqlite.connect(DB) as db:
             await db.execute(
@@ -300,9 +304,9 @@ except:
             await db.commit()
 
         await interaction.response.send_message(
-            f"❌ **{char[2].title()}** denied and removed.", ephemeral=True
+            f"❌ **{char[2].title()}** denied and removed.",
+            ephemeral=True
         )
-
 
 # ─── /drop ────────────────────────────────────────────────────────────────────
 
