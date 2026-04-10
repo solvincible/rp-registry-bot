@@ -500,7 +500,7 @@ async def search(interaction: discord.Interaction, query: str):
 
     async with aiosqlite.connect(DB) as db:
         cur = await db.execute(
-            """SELECT name, alias, owner_name, status FROM characters
+            """SELECT DISTINCT name, alias, owner_name, status FROM characters
                WHERE guild_id=? AND (name LIKE ? OR alias LIKE ? OR owner_name LIKE ?)""",
             (guild_id, f"%{q}%", f"%{q}%", f"%{q}%")
         )
@@ -618,10 +618,7 @@ async def on_member_remove(member: discord.Member):
 @bot.event
 async def on_ready():
     await init_db()
-    for guild in bot.guilds:
-        tree.copy_global_to(guild=guild)
-        await tree.sync(guild=guild)
-        print(f"Synced to: {guild.name}")
+    await tree.sync()
     print(f"Online — {bot.user}")
 
 
