@@ -1,30 +1,55 @@
+
+import os
 import discord
 from discord import app_commands
 import aiosqlite
+intents = discord.Intents.default()
+intents.message_content = True
 import os
-
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
 CLAIM_LIMIT         = 4
-
-APPROVAL_CHANNEL_ID = 1492095997675962428   # approved characters shown here
-PENDING_CHANNEL_ID  = 1492096016470773810   # submissions posted here; /claim only works here
-STAFF_ROLE_ID       = 1491359486370385930   # only this role can approve/deny
+APPROVAL_CHANNEL_ID = 1492095997675962428
+PENDING_CHANNEL_ID  = 1492096016470773810
+STAFF_ROLE_ID       = 1491359486370385930
 # ──────────────────────────────────────────────────────────────────────────────
-
 DB = "characters.db"
-
-intents = discord.Intents.default()
+intents         = discord.Intents.default()
 intents.members = True
-
+client = discord.Client(intents=intents)
+tree = app_commands.CommandTree(client)
+DB = "characters.db"
+MAX_CLAIMS = 4
+STAFF_ROLE_ID = 1491359486370385930
+# Channels — hardcoded IDs provided by server owner
+SUBMISSIONS_CHANNEL_ID = 1492096016470773810
+APPROVED_CHANNEL_ID    = 1492095997675962428
+ALLOWED_CHANNEL_IDS    = {SUBMISSIONS_CHANNEL_ID, APPROVED_CHANNEL_ID}
+def parse_channel_id(value):
+    if not value or value == "0":
+        return 0
+    if value.startswith("http"):
+        return int(value.rstrip("/").split("/")[-1])
+    return int(value)
+STAFF_CHANNEL_ID = parse_channel_id(os.environ.get("STAFF_CHANNEL_ID", "0"))
+# -------------------------
+# DATABASE SETUP
+# -------------------------
 bot  = discord.Client(intents=intents)
 tree = app_commands.CommandTree(bot)
-
-
 # ─── DATABASE ─────────────────────────────────────────────────────────────────
-
 async def init_db():
     async with aiosqlite.connect(DB) as db:
         await db.execute("""
+            CREATE TABLE IF NOT EXISTS characters (
+                name             TEXT PRIMARY KEY,
+                alias            TEXT,
+                wiki             TEXT,
+                image            TEXT,
+                description      TEXT,
+                owner_id         INTEGER,
+                owner_name       TEXT,
+                approved_msg_id  INTEGER
+            )
         CREATE TABLE IF NOT EXISTS characters (
             id              INTEGER PRIMARY KEY AUTOINCREMENT,
             guild_id        INTEGER,
@@ -40,15 +65,79 @@ async def init_db():
             pending_msg_id  INTEGER DEFAULT NULL
         )
         """)
+        # Migrate existing DB: add approved_msg_id column if missing
+        try:
+            await db.execute("ALTER TABLE characters ADD COLUMN approved_msg_id INTEGER")
+        except Exception:
+            pass
         await db.commit()
-
-
+async def get_character(name: str):
+    async with aiosqlite.connect(DB) as db:
+        cursor = await db.execute(
+            "SELECT * FROM characters WHERE name = ?", (name.lower(),)
+        )
+        return await cursor.fetchone()
+async def user_claim_count(user_id: int) -> int:
+    async with aiosqlite.connect(DB) as db:
+        cursor = await db.execute(
+            "SELECT COUNT(*) FROM characters WHERE owner_id = ?", (user_id,)
+        )
+        row = await cursor.fetchone()
+        return row[0] if row else 0
+async def delete_approved_message(name_key: str):
+    """Delete the character's post from the approved channel if it exists."""
+    async with aiosqlite.connect(DB) as db:
+        cursor = await db.execute(
+            "SELECT approved_msg_id FROM characters WHERE name = ?", (name_key,)
+        )
+        row = await cursor.fetchone()
+    if row and row[0]:
+        approved_channel = client.get_channel(APPROVED_CHANNEL_ID)
+        if approved_channel:
+            try:
+                msg = await approved_channel.fetch_message(row[0])
+                await msg.delete()
+            except (discord.NotFound, discord.Forbidden):
+                pass
+# -------------------------
+# CHANNEL RESTRICTION CHECK
+# -------------------------
+def allowed_channel_only():
+    async def predicate(interaction: discord.Interaction) -> bool:
+        if interaction.channel_id not in ALLOWED_CHANNEL_IDS:
+            await interaction.response.send_message(
+                "This command can only be used in the designated channels.", ephemeral=True
+            )
+            return False
+        return True
+    return app_commands.check(predicate)
+# -------------------------
+# ON READY
+# -------------------------
+@client.event
+async def on_ready():
+    await init_db()
+    for guild in client.guilds:
+        tree.copy_global_to(guild=guild)
+        await tree.sync(guild=guild)
+        print(f"Synced to: {guild.name}")
+    print(f"Logged in as {client.user}")
+# -------------------------
+# PING (test)
+# -------------------------
+@tree.command(name="ping", description="Check if the bot is alive")
+@allowed_channel_only()
+async def ping(interaction: discord.Interaction):
+    await interaction.response.send_message(
+        f"Pong! {round(client.latency * 1000)}ms", ephemeral=True
+    )
+# -------------------------
+# SUBMIT (inline → staff approval)
+# -------------------------
+@tree.command(name="submit", description="Submit a character for staff approval")
 # ─── HELPERS ──────────────────────────────────────────────────────────────────
-
 def is_staff(member: discord.Member) -> bool:
     return any(r.id == STAFF_ROLE_ID for r in member.roles)
-
-
 async def claim_count(guild_id: int, user_id: int) -> int:
     async with aiosqlite.connect(DB) as db:
         cur = await db.execute(
@@ -56,24 +145,34 @@ async def claim_count(guild_id: int, user_id: int) -> int:
             (guild_id, user_id)
         )
         return (await cur.fetchone())[0]
-
-
-def build_embed(char_name: str, alias: str, wiki: str, description: str,
-                image: str, owner: discord.Member, status: str) -> discord.Embed:
-    colour = discord.Colour.gold() if status == "pending" else discord.Colour.green()
-    embed  = discord.Embed(
+def pending_embed(char_name: str, alias: str, wiki: str,
+                  description: str, image: str, owner: discord.Member) -> discord.Embed:
+    embed = discord.Embed(
         title=f"{char_name.title()}  ·  {alias}",
         description=description,
-        colour=colour
+        colour=discord.Colour.from_rgb(255, 180, 0),   # warm gold — awaiting review
+        timestamp=discord.utils.utcnow()
     )
-    embed.add_field(name="Owner", value=owner.mention if owner else "Unknown", inline=True)
-    embed.add_field(name="Wiki",  value=wiki,                                  inline=True)
+    embed.add_field(name="Submitted by", value=owner.mention if owner else "Unknown", inline=True)
+    embed.add_field(name="Wiki",         value=wiki,                                  inline=True)
+    if image:
+        embed.set_thumbnail(url=image)
+    embed.set_footer(text="Awaiting staff review")
+    return embed
+def approved_embed(char_name: str, alias: str, wiki: str,
+                   description: str, image: str, owner: discord.Member) -> discord.Embed:
+    embed = discord.Embed(
+        title=f"{char_name.title()}  ·  {alias}",
+        description=description,
+        colour=discord.Colour.from_rgb(87, 242, 135),   # mint green — approved
+        timestamp=discord.utils.utcnow()
+    )
+    embed.add_field(name="Claimed by", value=owner.mention if owner else "Unknown", inline=True)
+    embed.add_field(name="Wiki",       value=wiki,                                   inline=True)
     if image:
         embed.set_image(url=image)
-    embed.set_footer(text=f"Status: {status.upper()}")
+    embed.set_footer(text="✓  Approved")
     return embed
-
-
 async def delete_message_safe(guild: discord.Guild, channel_id: int, message_id: int):
     if not channel_id or not message_id:
         return
@@ -84,445 +183,110 @@ async def delete_message_safe(guild: discord.Guild, channel_id: int, message_id:
             await msg.delete()
     except (discord.NotFound, discord.Forbidden, discord.HTTPException):
         pass
-
-
 async def _remove_character(guild: discord.Guild, char: tuple):
-    """Clean up embeds and delete from DB."""
-    # columns: 0=id 1=guild_id 2=name 3=alias 4=wiki 5=image
-    #          6=description 7=owner_id 8=owner_name 9=status
-    #          10=approved_msg_id 11=pending_msg_id
     await delete_message_safe(guild, APPROVAL_CHANNEL_ID, char[10])
     await delete_message_safe(guild, PENDING_CHANNEL_ID,  char[11])
     async with aiosqlite.connect(DB) as db:
         await db.execute("DELETE FROM characters WHERE id=?", (char[0],))
         await db.commit()
-
-
 # ─── /claim ───────────────────────────────────────────────────────────────────
-
 @tree.command(name="claim", description="Submit a character claim for staff approval.")
 @app_commands.describe(
+    name="Character name (e.g. Wanda Maximoff)",
+    alias="Alias or hero name (e.g. Scarlet Witch)",
+    wiki_link="Link to the character's wiki page",
+    description="Brief description of the character",
+    image="Attach an image file",
+    image_url="Or paste an image URL instead of attaching",
     name="Character's full name",
     alias="Alias / codename",
     wiki="Link to character wiki page",
     description="Short character description",
     image="Optional character image"
 )
-async def claim(
+@app_commands.rename(wiki_link="wiki-link", image_url="image-url")
+@allowed_channel_only()
+async def submit(
     interaction: discord.Interaction,
     name: str,
     alias: str,
-    wiki: str,
+    wiki_link: str,
     description: str,
-    image: discord.Attachment = None
+    image: discord.Attachment = None,
+    image_url: str = None,
 ):
-    # Must be used in the submissions channel only
-    if interaction.channel_id != PENDING_CHANNEL_ID:
+    existing = await get_character(name)
+    if existing:
         await interaction.response.send_message(
-            f"❌ Claims can only be submitted in <#{PENDING_CHANNEL_ID}>.",
-            ephemeral=True
+            f"**{name}** is already in the registry.", ephemeral=True
         )
         return
-
-    guild_id = interaction.guild.id
-
-    # Duplicate check (name OR alias, any status)
-    async with aiosqlite.connect(DB) as db:
-        cur = await db.execute(
-            "SELECT 1 FROM characters WHERE guild_id=? AND (name=? OR alias=?)",
-            (guild_id, name.lower(), alias.lower())
+    img = image.url if image else (image_url or "")
+    submission = {
+        "user_id": interaction.user.id,
+        "user_name": str(interaction.user),
+        "name": name.strip(),
+        "alias": alias.strip(),
+        "wiki": wiki_link.strip(),
+        "image": img,
+        "description": description.strip(),
+    }
+    staff_channel = client.get_channel(STAFF_CHANNEL_ID)
+    if not staff_channel:
+        await interaction.response.send_message(
+            "Staff channel not found. Contact an admin.", ephemeral=True
         )
-        if await cur.fetchone():
+        return
+    embed = discord.Embed(title=f"New Submission: {submission['name']}", color=discord.Color.orange())
+    embed.add_field(name="Alias", value=submission["alias"], inline=True)
+    embed.add_field(name="Submitted by", value=interaction.user.mention, inline=True)
+    embed.add_field(name="Wiki", value=submission["wiki"], inline=False)
+    embed.add_field(name="Description", value=submission["description"], inline=False)
+    if submission["image"]:
+        embed.set_image(url=submission["image"])
+    await staff_channel.send(embed=embed, view=ApprovalView(submission))
+    # Public confirmation so everyone can see proof of submission
+    await interaction.response.send_message(
+        f"{interaction.user.mention} has submitted **{submission['name']}** ({submission['alias']}) for staff review."
+    )
+# -------------------------
+# APPROVAL BUTTONS
+# -------------------------
+class ApprovalView(discord.ui.View):
+    def __init__(self, submission: dict):
+        super().__init__(timeout=None)
+        self.submission = submission
+    @discord.ui.button(label="Approve", style=discord.ButtonStyle.green)
+    async def approve(self, interaction: discord.Interaction, button: discord.ui.Button):
+        name_key = self.submission["name"].lower()
+        user_id = self.submission["user_id"]
+        count = await user_claim_count(user_id)
+        if count >= MAX_CLAIMS:
             await interaction.response.send_message(
-                "❌ A character with that name or alias is already claimed or pending approval.",
+                f"Cannot approve — {self.submission['user_name']} already has {MAX_CLAIMS} active claims.",
                 ephemeral=True
             )
             return
-
-    # Approved claim cap
-    if await claim_count(guild_id, interaction.user.id) >= CLAIM_LIMIT:
-        await interaction.response.send_message(
-            f"❌ You already have {CLAIM_LIMIT} approved characters. Drop one first.",
-            ephemeral=True
-        )
-        return
-
-    img_url = image.url if image else ""
-
-    # Insert as pending
-    async with aiosqlite.connect(DB) as db:
-        await db.execute(
-            """INSERT INTO characters
-               (guild_id, name, alias, wiki, image, description, owner_id, owner_name, status)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending')""",
-            (guild_id, name.lower(), alias, wiki, img_url,
-             description, interaction.user.id, interaction.user.name)
-        )
-        await db.commit()
-
-    # Post submission embed with Approve / Deny buttons
-    embed = build_embed(name, alias, wiki, description, img_url, interaction.user, "pending")
-    view  = ApprovalView(name.lower(), guild_id)
-    msg   = await interaction.channel.send(
-        content=f"📋 {interaction.user.mention} has submitted **{name.title()}** — awaiting staff review.",
-        embed=embed,
-        view=view
-    )
-
-    async with aiosqlite.connect(DB) as db:
-        await db.execute(
-            "UPDATE characters SET pending_msg_id=? WHERE guild_id=? AND name=?",
-            (msg.id, guild_id, name.lower())
-        )
-        await db.commit()
-
-    await interaction.response.send_message(
-        f"✅ **{name.title()}** submitted! Staff will review your claim shortly.",
-        ephemeral=True
-    )
-
-
-# ─── APPROVAL VIEW ────────────────────────────────────────────────────────────
-
-class ApprovalView(discord.ui.View):
-    def __init__(self, char_name: str, guild_id: int):
-        super().__init__(timeout=None)
-        self.char_name = char_name
-        self.guild_id = guild_id
-
-    @discord.ui.button(label="Approve ✅", style=discord.ButtonStyle.success, custom_id="btn_approve")
-    async def approve_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not is_staff(interaction.user):
-            await interaction.response.send_message("❌ Only staff can approve claims.", ephemeral=True)
-            return
-        await self._approve(interaction)
-
-    @discord.ui.button(label="Deny ❌", style=discord.ButtonStyle.danger, custom_id="btn_deny")
-    async def deny_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not is_staff(interaction.user):
-            await interaction.response.send_message("❌ Only staff can deny claims.", ephemeral=True)
-            return
-        await self._deny(interaction)
-
-    async def _approve(self, interaction: discord.Interaction):
-        async with aiosqlite.connect(DB) as db:
-            cur = await db.execute(
-                "SELECT * FROM characters WHERE guild_id=? AND name=?",
-                (self.guild_id, self.char_name)
-            )
-            char = await cur.fetchone()
-
-        if not char or char[9] != "pending":
-            await interaction.response.send_message("This claim is no longer pending.", ephemeral=True)
-            return
-
-        owner = interaction.guild.get_member(char[7])
-
-        # Post to approved channel
-        approved_channel = interaction.guild.get_channel(APPROVAL_CHANNEL_ID)
+        approved_channel = client.get_channel(APPROVED_CHANNEL_ID)
         approved_msg_id = None
-
         if approved_channel:
-            embed = build_embed(char[2], char[3], char[4], char[6], char[5], owner, "approved")
+            embed = discord.Embed(
+                title=f"{self.submission['name']} ({self.submission['alias']})",
+                description=self.submission["description"],
+                color=discord.Color.green()
+            )
+            embed.add_field(name="Wiki", value=self.submission["wiki"], inline=False)
+            embed.add_field(name="Claimed by", value=self.submission["user_name"], inline=False)
+            if self.submission["image"]:
+                embed.set_image(url=self.submission["image"])
             msg = await approved_channel.send(embed=embed)
             approved_msg_id = msg.id
-
         async with aiosqlite.connect(DB) as db:
-            await db.execute(
-                "UPDATE characters SET status='approved', approved_msg_id=? WHERE guild_id=? AND name=?",
-                (approved_msg_id, self.guild_id, self.char_name)
-            )
-            await db.commit()
-
-        # Update pending message instead of deleting
-        try:
-            channel = interaction.guild.get_channel(PENDING_CHANNEL_ID)
-            msg = await channel.fetch_message(char[11])
-
-            embed = msg.embeds[0]
-            embed.colour = discord.Colour.green()
-            embed.set_footer(text="APPROVED")
-
-            await msg.edit(content="📌 CLAIM APPROVED", embed=embed, view=None)
-        except:
-            pass
-
-        # DM owner
-        if owner:
-            try:
-                await owner.send(
-                    f"✅ Your claim for **{char[2].title()}** on **{interaction.guild.name}** has been approved!"
-                )
-            except discord.Forbidden:
-                pass
-
-        await interaction.response.send_message(
-            f"✅ **{char[2].title()}** approved and posted to <#{APPROVAL_CHANNEL_ID}>.",
-            ephemeral=True
-        )
-
-    async def _deny(self, interaction: discord.Interaction):
-        async with aiosqlite.connect(DB) as db:
-            cur = await db.execute(
-                "SELECT * FROM characters WHERE guild_id=? AND name=?",
-                (self.guild_id, self.char_name)
-            )
-            char = await cur.fetchone()
-
-        if not char:
-            await interaction.response.send_message("Character not found.", ephemeral=True)
-            return
-
-        owner = interaction.guild.get_member(char[7])
-
-        if owner:
-            try:
-                await owner.send(
-                    f"❌ Your claim for **{char[2].title()}** on **{interaction.guild.name}** was denied by staff."
-                )
-            except discord.Forbidden:
-                pass
-
-        # Update pending message instead of deleting
-        try:
-            channel = interaction.guild.get_channel(PENDING_CHANNEL_ID)
-            msg = await channel.fetch_message(char[11])
-
-            embed = msg.embeds[0]
-            embed.colour = discord.Colour.red()
-            embed.set_footer(text="DENIED")
-
-            await msg.edit(content="📌 CLAIM DENIED", embed=embed, view=None)
-        except:
-            pass
-
-        async with aiosqlite.connect(DB) as db:
-            await db.execute(
-                "DELETE FROM characters WHERE guild_id=? AND name=?",
-                (self.guild_id, self.char_name)
-            )
-            await db.commit()
-
-        await interaction.response.send_message(
-            f"❌ **{char[2].title()}** denied and removed.",
-            ephemeral=True
-        )
-
-# ─── /drop ────────────────────────────────────────────────────────────────────
-
-@tree.command(name="drop", description="Drop one of your claimed characters.")
-@app_commands.describe(name="The character's name")
-async def drop(interaction: discord.Interaction, name: str):
-    guild_id = interaction.guild.id
-
-    async with aiosqlite.connect(DB) as db:
-        cur = await db.execute(
-            "SELECT * FROM characters WHERE guild_id=? AND name=?",
-            (guild_id, name.lower())
-        )
-        char = await cur.fetchone()
-
-    if not char:
-        await interaction.response.send_message("Character not found.", ephemeral=True)
-        return
-
-    if char[7] != interaction.user.id:
-        await interaction.response.send_message("You don't own this character.", ephemeral=True)
-        return
-
-    await _remove_character(interaction.guild, char)
-    await interaction.response.send_message(f"🗑️ **{name.title()}** has been dropped.")
-
-
-# ─── /remove_character (staff) ────────────────────────────────────────────────
-
-@tree.command(name="remove_character", description="[Staff] Force-remove any character.")
-@app_commands.describe(name="The character's name")
-async def remove_character(interaction: discord.Interaction, name: str):
-    if not is_staff(interaction.user):
-        await interaction.response.send_message("❌ Staff only.", ephemeral=True)
-        return
-
-    guild_id = interaction.guild.id
-
-    async with aiosqlite.connect(DB) as db:
-        cur = await db.execute(
-            "SELECT * FROM characters WHERE guild_id=? AND name=?",
-            (guild_id, name.lower())
-        )
-        char = await cur.fetchone()
-
-    if not char:
-        await interaction.response.send_message("Character not found.", ephemeral=True)
-        return
-
-    await _remove_character(interaction.guild, char)
-    await interaction.response.send_message(f"🗑️ **{name.title()}** removed by staff.")
-
-
-# ─── /transfer ────────────────────────────────────────────────────────────────
-
-@tree.command(name="transfer", description="Transfer one of your characters to another user.")
-@app_commands.describe(
-    name="The character's name",
-    user="The user to transfer to"
-)
-async def transfer(interaction: discord.Interaction, name: str, user: discord.Member):
-    guild_id = interaction.guild.id
-
-    if user.bot:
-        await interaction.response.send_message("❌ Cannot transfer to a bot.", ephemeral=True)
-        return
-
-    if user.id == interaction.user.id:
-        await interaction.response.send_message("❌ You can't transfer to yourself.", ephemeral=True)
-        return
-
-    async with aiosqlite.connect(DB) as db:
-        cur = await db.execute(
-            "SELECT * FROM characters WHERE guild_id=? AND name=?",
-            (guild_id, name.lower())
-        )
-        char = await cur.fetchone()
-
-    if not char:
-        await interaction.response.send_message("Character not found.", ephemeral=True)
-        return
-
-    if char[7] != interaction.user.id:
-        await interaction.response.send_message("You don't own this character.", ephemeral=True)
-        return
-
-    if await claim_count(guild_id, user.id) >= CLAIM_LIMIT:
-        await interaction.response.send_message(
-            f"❌ {user.display_name} already has {CLAIM_LIMIT} approved characters.",
-            ephemeral=True
-        )
-        return
-
-    async with aiosqlite.connect(DB) as db:
-        await db.execute(
-            "UPDATE characters SET owner_id=?, owner_name=? WHERE guild_id=? AND name=?",
-            (user.id, user.name, guild_id, name.lower())
-        )
-        await db.commit()
-
-    # Update the approved embed in-place if it exists
-    if char[10]:
-        try:
-            approved_channel = interaction.guild.get_channel(APPROVAL_CHANNEL_ID)
-            if approved_channel:
-                msg   = await approved_channel.fetch_message(char[10])
-                embed = build_embed(char[2], char[3], char[4], char[6], char[5], user, "approved")
-                await msg.edit(embed=embed)
-        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-            pass
-
-    await interaction.response.send_message(
-        f"✅ **{name.title()}** transferred from {interaction.user.mention} to {user.mention}."
-    )
-
-
-# ─── /search ──────────────────────────────────────────────────────────────────
-
-@tree.command(name="search", description="Search for characters by name, alias, or owner.")
-@app_commands.describe(query="Name, alias, or username to search for")
-async def search(interaction: discord.Interaction, query: str):
-    guild_id = interaction.guild.id
-    q        = query.lower().strip().lstrip("@")
-
-    async with aiosqlite.connect(DB) as db:
-        cur = await db.execute(
-            """SELECT name, alias, owner_name, status FROM characters
-               WHERE guild_id=? AND (name LIKE ? OR alias LIKE ? OR owner_name LIKE ?)""",
-            (guild_id, f"%{q}%", f"%{q}%", f"%{q}%")
-        )
-        rows = await cur.fetchall()
-
-    if not rows:
-        await interaction.response.send_message(
-            f"No characters found matching **{query}**.", ephemeral=True
-        )
-        return
-
-    lines = [
-        f"**{r[0].title()}** ({r[1]}) — {r[2]}  `[{r[3].upper()}]`"
-        for r in rows
-    ]
-    embed = discord.Embed(
-        title=f"Search: \"{query}\"",
-        description="\n".join(lines)[:4096],
-        colour=discord.Colour.blurple()
-    )
-    await interaction.response.send_message(embed=embed)
-
-
-# ─── /character ───────────────────────────────────────────────────────────────
-
-@tree.command(name="character", description="Look up a character's full profile.")
-@app_commands.describe(name="The character's name")
-async def character(interaction: discord.Interaction, name: str):
-    guild_id = interaction.guild.id
-
-    async with aiosqlite.connect(DB) as db:
-        cur = await db.execute(
-            "SELECT * FROM characters WHERE guild_id=? AND name=?",
-            (guild_id, name.lower())
-        )
-        char = await cur.fetchone()
-
-    if not char:
-        await interaction.response.send_message("Character not found.", ephemeral=True)
-        return
-
-    owner = interaction.guild.get_member(char[7])
-    embed = build_embed(char[2], char[3], char[4], char[6], char[5], owner, char[9])
-    await interaction.response.send_message(embed=embed)
-
-
-# ─── /roster ──────────────────────────────────────────────────────────────────
-
-@tree.command(name="roster", description="View all approved characters in this server.")
-async def roster(interaction: discord.Interaction):
-    guild_id = interaction.guild.id
-
-    async with aiosqlite.connect(DB) as db:
-        cur = await db.execute(
-            "SELECT name, alias, owner_name FROM characters WHERE guild_id=? AND status='approved'",
-            (guild_id,)
-        )
-        rows = await cur.fetchall()
-
-    if not rows:
-        await interaction.response.send_message("No approved characters yet.")
-        return
-
-    lines = [f"**{r[0].title()}** ({r[1]}) — {r[2]}" for r in rows]
-    await interaction.response.send_message("\n".join(lines)[:2000])
-
-
-# ─── AUTO-DROP ON MEMBER LEAVE ────────────────────────────────────────────────
-
-@bot.event
-async def on_member_remove(member: discord.Member):
-    async with aiosqlite.connect(DB) as db:
-        cur = await db.execute(
-            "SELECT * FROM characters WHERE guild_id=? AND owner_id=?",
-            (member.guild.id, member.id)
-        )
-        chars = await cur.fetchall()
-
-    for char in chars:
-        await _remove_character(member.guild, char)
-
-
-# ─── STARTUP ──────────────────────────────────────────────────────────────────
-
-@bot.event
-async def on_ready():
-    await init_db()
-    await tree.sync()
-    print(f"Logged in as {bot.user}")
-
-
-bot.run(os.getenv("TOKEN"))
+ ...
+[truncated]
+[truncated]
+[truncated]
+-1
++1
+[truncated]
+[truncated]
