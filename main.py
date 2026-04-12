@@ -1218,12 +1218,13 @@ async def on_ready():
 
     for guild in bot.guilds:
         tree.copy_global_to(guild=guild)
-        await tree.sync(guild=guild)
+        synced = await tree.sync(guild=guild)
+        print(f"Synced {len(synced)} commands to: {guild.name} ({guild.id})")
 
     tree.clear_commands(guild=None)
     await tree.sync()
 
-    print(f"Online — {bot.user}")
+    print(f"Online — {bot.user} | In {len(bot.guilds)} guild(s)")
 
 
 bot.run(os.getenv("DISCORD_TOKEN"))
