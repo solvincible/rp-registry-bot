@@ -11,6 +11,11 @@ STAFF_ROLE_ID       = 1491359486370385930
 
 # Set DB_PATH env var on Railway to point at your mounted volume, e.g. /data/characters.db
 DB = os.getenv("DB_PATH", "characters.db")
+
+# Ensure the directory for the database file exists
+_db_dir = os.path.dirname(DB)
+if _db_dir:
+    os.makedirs(_db_dir, exist_ok=True)
 # ──────────────────────────────────────────────────────────────────────────────
 
 intents         = discord.Intents.default()
