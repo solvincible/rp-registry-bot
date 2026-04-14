@@ -4,6 +4,8 @@ import aiosqlite
 import os
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
+# These are fallback defaults used before /setup has been run in a guild.
+# After /setup is used, all values are stored per-guild in the database.
 CLAIM_LIMIT         = 4
 APPROVAL_CHANNEL_ID = 1492095997675962428
 PENDING_CHANNEL_ID  = 1492096016470773810
@@ -16,6 +18,44 @@ DB = os.getenv("DB_PATH", "characters.db")
 _db_dir = os.path.dirname(DB)
 if _db_dir:
     os.makedirs(_db_dir, exist_ok=True)
+# ──────────────────────────────────────────────────────────────────────────────
+
+# ─── GUILD CONFIG HELPERS ─────────────────────────────────────────────────────
+# These replace all direct references to the global ID constants so that each
+# guild can have its own channels and roles configured via /setup.
+
+async def get_guild_config(guild_id: int) -> dict:
+    """Return the stored config for a guild, falling back to global defaults."""
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute(
+            "SELECT key, value FROM guild_config WHERE guild_id=?", (guild_id,)
+        )
+        rows = await cur.fetchall()
+    cfg = {row[0]: int(row[1]) for row in rows if row[1]}
+    return cfg
+
+
+async def cfg(guild_id: int, key: str):
+    """Return a single config value for a guild, or the hardcoded fallback."""
+    fallbacks = {
+        "approval_channel_id": APPROVAL_CHANNEL_ID,
+        "pending_channel_id":  PENDING_CHANNEL_ID,
+        "staff_role_id":       STAFF_ROLE_ID,
+        "claim_limit":         CLAIM_LIMIT,
+    }
+    data = await get_guild_config(guild_id)
+    return data.get(key, fallbacks.get(key))
+
+
+async def set_guild_cfg(guild_id: int, key: str, value: int):
+    async with aiosqlite.connect(DB) as db:
+        await db.execute(
+            """INSERT INTO guild_config (guild_id, key, value)
+               VALUES (?, ?, ?)
+               ON CONFLICT(guild_id, key) DO UPDATE SET value=excluded.value""",
+            (guild_id, key, value)
+        )
+        await db.commit()
 # ──────────────────────────────────────────────────────────────────────────────
 
 intents         = discord.Intents.default()
@@ -33,6 +73,14 @@ tree = app_commands.CommandTree(bot)
 
 async def init_db():
     async with aiosqlite.connect(DB) as db:
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS guild_config (
+            guild_id  INTEGER NOT NULL,
+            key       TEXT    NOT NULL,
+            value     TEXT    NOT NULL,
+            PRIMARY KEY (guild_id, key)
+        )
+        """)
         await db.execute("""
         CREATE TABLE IF NOT EXISTS characters (
             id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -61,8 +109,9 @@ async def init_db():
 
 # ─── HELPERS ──────────────────────────────────────────────────────────────────
 
-def is_staff(member: discord.Member) -> bool:
-    return any(r.id == STAFF_ROLE_ID for r in member.roles)
+async def is_staff(member: discord.Member) -> bool:
+    staff_role_id = await cfg(member.guild.id, "staff_role_id")
+    return any(r.id == staff_role_id for r in member.roles)
 
 
 def char_fandom(char: tuple) -> str:
@@ -141,8 +190,10 @@ async def delete_message_safe(guild: discord.Guild, channel_id: int, message_id:
 
 
 async def _remove_character(guild: discord.Guild, char: tuple):
-    await delete_message_safe(guild, APPROVAL_CHANNEL_ID, char[10])
-    await delete_message_safe(guild, PENDING_CHANNEL_ID,  char[11])
+    approval_ch = await cfg(guild.id, "approval_channel_id")
+    pending_ch  = await cfg(guild.id, "pending_channel_id")
+    await delete_message_safe(guild, approval_ch, char[10])
+    await delete_message_safe(guild, pending_ch,  char[11])
     async with aiosqlite.connect(DB) as db:
         await db.execute("DELETE FROM characters WHERE id=?", (char[0],))
         await db.commit()
@@ -212,7 +263,8 @@ class EditCharacterModal(discord.ui.Modal, title="Edit Character"):
         if char and char[10]:
             try:
                 owner   = interaction.guild.get_member(char[7])
-                channel = interaction.guild.get_channel(APPROVAL_CHANNEL_ID)
+                approval_ch_id = await cfg(interaction.guild.id, "approval_channel_id")
+                channel = interaction.guild.get_channel(approval_ch_id)
                 if channel:
                     msg   = await channel.fetch_message(char[10])
                     embed = approved_embed(
@@ -264,7 +316,8 @@ class DenyReasonModal(discord.ui.Modal, title="Deny Claim"):
         reason_text = str(self.reason.value).strip() if self.reason.value else None
 
         try:
-            channel = interaction.guild.get_channel(PENDING_CHANNEL_ID)
+            pending_ch_id = await cfg(interaction.guild.id, "pending_channel_id")
+            channel = interaction.guild.get_channel(pending_ch_id)
             msg     = await channel.fetch_message(char[11])
 
             denial = discord.Embed(
@@ -307,14 +360,14 @@ class ApprovalView(discord.ui.View):
 
     @discord.ui.button(label="Approve", style=discord.ButtonStyle.success, custom_id="btn_approve")
     async def approve_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not is_staff(interaction.user):
+        if not await is_staff(interaction.user):
             await interaction.response.send_message("Staff only.", ephemeral=True)
             return
         await self._approve(interaction)
 
     @discord.ui.button(label="Deny", style=discord.ButtonStyle.danger, custom_id="btn_deny")
     async def deny_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not is_staff(interaction.user):
+        if not await is_staff(interaction.user):
             await interaction.response.send_message("Staff only.", ephemeral=True)
             return
         await interaction.response.send_modal(DenyReasonModal(interaction.message.id))
@@ -333,7 +386,8 @@ class ApprovalView(discord.ui.View):
 
         owner = interaction.guild.get_member(char[7])
 
-        approved_channel = interaction.guild.get_channel(APPROVAL_CHANNEL_ID)
+        approval_ch_id   = await cfg(interaction.guild.id, "approval_channel_id")
+        approved_channel = interaction.guild.get_channel(approval_ch_id)
         approved_msg_id  = None
         if approved_channel:
             embed = approved_embed(
@@ -360,7 +414,7 @@ class ApprovalView(discord.ui.View):
             receipt.add_field(name="Claimed by",  value=f"<@{char[7]}>",         inline=True)
             receipt.add_field(name="Approved by", value=interaction.user.mention, inline=True)
             if approved_msg_id:
-                receipt.add_field(name="Posted to", value=f"<#{APPROVAL_CHANNEL_ID}>", inline=False)
+                receipt.add_field(name="Posted to", value=f"<#{approval_ch_id}>", inline=False)
             receipt.set_footer(text="✓  This claim is closed.")
             await interaction.message.edit(content="", embed=receipt, view=None)
         except Exception:
@@ -375,7 +429,7 @@ class ApprovalView(discord.ui.View):
                 pass
 
         await interaction.response.send_message(
-            f"**{char[2].title()}** approved and posted to <#{APPROVAL_CHANNEL_ID}>.", ephemeral=True
+            f"**{char[2].title()}** approved and posted to <#{approval_ch_id}>.", ephemeral=True
         )
 
 
@@ -403,9 +457,10 @@ async def claim(
     image: discord.Attachment = None,
     image_url: str = ""
 ):
-    if interaction.channel_id != PENDING_CHANNEL_ID:
+    pending_ch_id = await cfg(interaction.guild.id, "pending_channel_id")
+    if interaction.channel_id != pending_ch_id:
         await interaction.response.send_message(
-            f"Claims can only be submitted in <#{PENDING_CHANNEL_ID}>.", ephemeral=True
+            f"Claims can only be submitted in <#{pending_ch_id}>.", ephemeral=True
         )
         return
 
@@ -423,9 +478,10 @@ async def claim(
             )
             return
 
-    if await claim_count(guild_id, interaction.user.id) >= CLAIM_LIMIT:
+    claim_lim = await cfg(guild_id, "claim_limit")
+    if await claim_count(guild_id, interaction.user.id) >= claim_lim:
         await interaction.response.send_message(
-            f"You already have {CLAIM_LIMIT} approved characters. Drop one before claiming another.",
+            f"You already have {claim_lim} approved characters. Drop one before claiming another.",
             ephemeral=True
         )
         return
@@ -480,7 +536,7 @@ async def edit(interaction: discord.Interaction, name: str):
         await interaction.response.send_message("Character not found.", ephemeral=True)
         return
 
-    if char[7] != interaction.user.id and not is_staff(interaction.user):
+    if char[7] != interaction.user.id and not await is_staff(interaction.user):
         await interaction.response.send_message("You don't own this character.", ephemeral=True)
         return
 
@@ -566,7 +622,7 @@ async def whois(interaction: discord.Interaction, user: discord.Member):
 
     if approved:
         embed.add_field(
-            name=f"Approved ({len(approved)}/{CLAIM_LIMIT})",
+            name=f"Approved ({len(approved)}/{await cfg(guild_id, 'claim_limit')})",
             value="\n".join(fmt(r) for r in approved),
             inline=False
         )
@@ -629,7 +685,7 @@ async def fandom_cmd(interaction: discord.Interaction, name: str):
 @tree.command(name="hiatus", description="[Staff] Toggle hiatus status on a character.")
 @app_commands.describe(name="The character's name")
 async def hiatus(interaction: discord.Interaction, name: str):
-    if not is_staff(interaction.user):
+    if not await is_staff(interaction.user):
         await interaction.response.send_message("Staff only.", ephemeral=True)
         return
 
@@ -664,8 +720,9 @@ async def hiatus(interaction: discord.Interaction, name: str):
     # Update the approved channel embed
     if char[10]:
         try:
-            owner   = interaction.guild.get_member(char[7])
-            channel = interaction.guild.get_channel(APPROVAL_CHANNEL_ID)
+            owner          = interaction.guild.get_member(char[7])
+            approval_ch_id = await cfg(guild_id, "approval_channel_id")
+            channel = interaction.guild.get_channel(approval_ch_id)
             if channel:
                 msg   = await channel.fetch_message(char[10])
                 embed = approved_embed(
@@ -688,7 +745,7 @@ async def hiatus(interaction: discord.Interaction, name: str):
 @tree.command(name="forcetransfer", description="[Staff] Transfer any character to another user.")
 @app_commands.describe(name="The character's name", user="The user to transfer to")
 async def forcetransfer(interaction: discord.Interaction, name: str, user: discord.Member):
-    if not is_staff(interaction.user):
+    if not await is_staff(interaction.user):
         await interaction.response.send_message("Staff only.", ephemeral=True)
         return
 
@@ -709,9 +766,10 @@ async def forcetransfer(interaction: discord.Interaction, name: str, user: disco
         await interaction.response.send_message("Character not found.", ephemeral=True)
         return
 
-    if await claim_count(guild_id, user.id) >= CLAIM_LIMIT:
+    claim_lim = await cfg(guild_id, "claim_limit")
+    if await claim_count(guild_id, user.id) >= claim_lim:
         await interaction.response.send_message(
-            f"{user.display_name} already has {CLAIM_LIMIT} approved characters.", ephemeral=True
+            f"{user.display_name} already has {claim_lim} approved characters.", ephemeral=True
         )
         return
 
@@ -726,7 +784,8 @@ async def forcetransfer(interaction: discord.Interaction, name: str, user: disco
 
     if char[10]:
         try:
-            channel = interaction.guild.get_channel(APPROVAL_CHANNEL_ID)
+            approval_ch_id = await cfg(guild_id, "approval_channel_id")
+            channel = interaction.guild.get_channel(approval_ch_id)
             if channel:
                 msg   = await channel.fetch_message(char[10])
                 embed = approved_embed(
@@ -747,7 +806,7 @@ async def forcetransfer(interaction: discord.Interaction, name: str, user: disco
 
 @tree.command(name="pending", description="[Staff] View all currently pending claims.")
 async def pending(interaction: discord.Interaction):
-    if not is_staff(interaction.user):
+    if not await is_staff(interaction.user):
         await interaction.response.send_message("Staff only.", ephemeral=True)
         return
 
@@ -768,7 +827,8 @@ async def pending(interaction: discord.Interaction):
     lines = []
     for r in rows:
         tags = _build_meta_tags(r[2], r[3])
-        jump = f"https://discord.com/channels/{guild_id}/{PENDING_CHANNEL_ID}/{r[5]}" if r[5] else ""
+        pending_ch_id = await cfg(guild_id, "pending_channel_id")
+        jump = f"https://discord.com/channels/{guild_id}/{pending_ch_id}/{r[5]}" if r[5] else ""
         line = f"**{r[0].title()}** · {r[1]}" + (f"  {tags}" if tags else "") + f" — {r[4]}"
         if jump:
             line += f"  [↗]({jump})"
@@ -817,7 +877,7 @@ async def drop(interaction: discord.Interaction, name: str):
 @tree.command(name="remove_character", description="[Staff] Force-remove any character.")
 @app_commands.describe(name="The character's name")
 async def remove_character(interaction: discord.Interaction, name: str):
-    if not is_staff(interaction.user):
+    if not await is_staff(interaction.user):
         await interaction.response.send_message("Staff only.", ephemeral=True)
         return
 
@@ -868,9 +928,10 @@ async def transfer(interaction: discord.Interaction, name: str, user: discord.Me
         await interaction.response.send_message("You don't own this character.", ephemeral=True)
         return
 
-    if await claim_count(guild_id, user.id) >= CLAIM_LIMIT:
+    claim_lim = await cfg(guild_id, "claim_limit")
+    if await claim_count(guild_id, user.id) >= claim_lim:
         await interaction.response.send_message(
-            f"{user.display_name} already has {CLAIM_LIMIT} approved characters.", ephemeral=True
+            f"{user.display_name} already has {claim_lim} approved characters.", ephemeral=True
         )
         return
 
@@ -883,7 +944,8 @@ async def transfer(interaction: discord.Interaction, name: str, user: discord.Me
 
     if char[10]:
         try:
-            channel = interaction.guild.get_channel(APPROVAL_CHANNEL_ID)
+            approval_ch_id = await cfg(guild_id, "approval_channel_id")
+            channel = interaction.guild.get_channel(approval_ch_id)
             if channel:
                 msg   = await channel.fetch_message(char[10])
                 embed = approved_embed(
@@ -933,7 +995,7 @@ async def myclaims(interaction: discord.Interaction):
 
     if approved:
         embed.add_field(
-            name=f"Approved ({len(approved)}/{CLAIM_LIMIT})",
+            name=f"Approved ({len(approved)}/{await cfg(guild_id, 'claim_limit')})",
             value="\n".join(fmt(r) for r in approved),
             inline=False
         )
@@ -1141,6 +1203,89 @@ async def stats(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed)
 
 
+# ─── /setup ───────────────────────────────────────────────────────────────────
+
+@tree.command(name="setup", description="[Staff] Configure the bot's channels, roles, and claim limit for this server.")
+@app_commands.describe(
+    pending_channel  = "Channel where players submit claims (e.g. #character-claims)",
+    approval_channel = "Channel where approved characters are posted (e.g. #approved-characters)",
+    staff_role       = "Role that can approve/deny claims",
+    claim_limit      = "Maximum number of approved characters per player (default 4)"
+)
+async def setup(
+    interaction: discord.Interaction,
+    pending_channel:  discord.TextChannel,
+    approval_channel: discord.TextChannel,
+    staff_role:       discord.Role,
+    claim_limit:      app_commands.Range[int, 1, 20] = 4
+):
+    # Only members who already have the configured staff role (or Administrator) may run setup
+    is_admin = interaction.user.guild_permissions.administrator
+    already_staff = await is_staff(interaction.user)
+    if not is_admin and not already_staff:
+        await interaction.response.send_message(
+            "You need the staff role or Administrator permission to run setup.",
+            ephemeral=True
+        )
+        return
+
+    guild_id = interaction.guild.id
+
+    await set_guild_cfg(guild_id, "pending_channel_id",  pending_channel.id)
+    await set_guild_cfg(guild_id, "approval_channel_id", approval_channel.id)
+    await set_guild_cfg(guild_id, "staff_role_id",       staff_role.id)
+    await set_guild_cfg(guild_id, "claim_limit",         claim_limit)
+
+    embed = discord.Embed(
+        title="Setup Complete",
+        description="The bot has been configured for this server. You can re-run `/setup` at any time to change these settings.",
+        colour=discord.Colour.from_rgb(87, 242, 135),
+        timestamp=discord.utils.utcnow()
+    )
+    embed.add_field(name="Submissions channel", value=pending_channel.mention,  inline=True)
+    embed.add_field(name="Approved channel",    value=approval_channel.mention, inline=True)
+    embed.add_field(name="Staff role",          value=staff_role.mention,       inline=True)
+    embed.add_field(name="Claim limit",         value=str(claim_limit),         inline=True)
+    embed.set_footer(text=f"Configured by {interaction.user.display_name}")
+
+    await interaction.response.send_message(embed=embed)
+
+
+@tree.command(name="config", description="[Staff] View the current bot configuration for this server.")
+async def config_cmd(interaction: discord.Interaction):
+    if not interaction.user.guild_permissions.administrator and not await is_staff(interaction.user):
+        await interaction.response.send_message("Staff only.", ephemeral=True)
+        return
+
+    guild_id = interaction.guild.id
+    g_cfg    = await get_guild_config(guild_id)
+
+    def mention_ch(key, fallback):
+        val = g_cfg.get(key, fallback)
+        return f"<#{val}>" if val else "Not set"
+
+    def mention_role(key, fallback):
+        val = g_cfg.get(key, fallback)
+        return f"<@&{val}>" if val else "Not set"
+
+    using_defaults = not g_cfg
+    embed = discord.Embed(
+        title="Bot Configuration",
+        description=(
+            "⚠️ **No setup has been run yet — using hardcoded defaults.**\nRun `/setup` to configure the bot for this server."
+            if using_defaults else
+            "Current configuration for this server. Run `/setup` to change any of these."
+        ),
+        colour=discord.Colour.from_rgb(255, 180, 0) if using_defaults else discord.Colour.blurple(),
+        timestamp=discord.utils.utcnow()
+    )
+    embed.add_field(name="Submissions channel", value=mention_ch("pending_channel_id",   PENDING_CHANNEL_ID),  inline=True)
+    embed.add_field(name="Approved channel",    value=mention_ch("approval_channel_id",  APPROVAL_CHANNEL_ID), inline=True)
+    embed.add_field(name="Staff role",          value=mention_role("staff_role_id",      STAFF_ROLE_ID),       inline=True)
+    embed.add_field(name="Claim limit",         value=str(g_cfg.get("claim_limit", CLAIM_LIMIT)),              inline=True)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
 # ─── /help ────────────────────────────────────────────────────────────────────
 
 @tree.command(name="help", description="View all available commands.")
@@ -1171,6 +1316,8 @@ async def help_cmd(interaction: discord.Interaction):
     embed.add_field(
         name="Staff Commands",
         value=(
+            "`/setup` — Configure channels, roles, and claim limit\n"
+            "`/config` — View the current bot configuration\n"
             "`/pending` — View all pending claims with jump links\n"
             "`/hiatus` — Toggle hiatus on a character\n"
             "`/forcetransfer` — Transfer any character without owner consent\n"
@@ -1196,7 +1343,8 @@ async def on_member_remove(member: discord.Member):
     if not chars:
         return
 
-    pending_channel = member.guild.get_channel(PENDING_CHANNEL_ID)
+    pending_ch_id   = await cfg(member.guild.id, "pending_channel_id")
+    pending_channel = member.guild.get_channel(pending_ch_id)
 
     for char in chars:
         await _remove_character(member.guild, char)
